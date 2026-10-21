@@ -9,7 +9,7 @@ An end-to-end analytics project that takes 1M+ raw wholesale transactions throug
 
 **Author:** Yasir Sheikh | Aspiring Data Analyst / BI Analyst
 
-![Dashboard preview](images/01_overview_customer.png)
+![Dashboard preview](Assets/Snapshot/Mockups/1.png)
 
 > **Disclaimer:** "IKEA Gifting" is a fictional brand name used only for this educational portfolio project. It is not affiliated with or endorsed by the real IKEA. All figures come from a public, anonymised retail dataset and do not reflect any real company's performance. The dashboard branding is for design and storytelling purposes only.
 
@@ -66,48 +66,131 @@ I used the raw data rather than a pre-cleaned version, so the project includes g
 
 ---
 
-## Key Findings
-
-1. **A small group drives most of the revenue.** Champions are roughly 22% of customers but generate about 68% of revenue, a clear 80/20-style concentration.
-2. **Churn is a serious risk, not a minor one.** More than half of customers have been inactive for 90+ days.
-3. **There is a clear win-back target.** 823 "At Risk" customers used to buy often and are now inactive.
-4. **Growth stalled after 2010.** Active customers rose from 1.0K (2009) to 4.2K (2010), then stayed flat in 2011.
-5. **Sales peak in Q4**, which fits a gifting-focused product range (Q4: 4,101 customers and $6.2M revenue).
-6. **The UK is the core market**, with about 5,350 customers and roughly $14.4M in revenue.
-
----
-
-## Recommended Actions
-
-| Segment | Who they are | Suggested action |
+## 1. Tech Stack
+ 
+| Layer | Tool | Purpose |
 |---|---|---|
-| **Champions** | Recent, frequent, high spenders | Loyalty perks and early access to new ranges |
-| **Loyal** | Steady repeat buyers | Upsell to move them toward Champions |
-| **At Risk** | Used to buy often, now inactive | Personalised win-back discounts (top priority) |
-| **Need Attention** | Buying less often | Reorder reminders and time-limited offers |
-| **New** | Recent first-time buyers | Welcome offer to drive a second order |
-| **Lost** | Inactive, low engagement | Low-cost email reactivation only |
-
+| Data engineering | Microsoft SQL Server, SSMS | Ingestion, type casting, union, exploration, deduplication |
+| Analysis & modelling | Python (Jupyter, Pandas) | RFM metrics, quintile scoring, segmentation, churn flag |
+| Visualisation | Power BI Desktop, DAX | KPI measures, interactive multi-page dashboard |
+ 
 ---
-
-## Project Workflow
-
+ 
+## 2. Pipeline Architecture
+ 
 ```
-Business questions → SQL Server → Python → Power BI
-                     Clean & merge   Score & segment   Visualise & share
+Raw data (2 files, 1M+ rows)
+        │
+        ▼
+[SQL Server / SSMS]   Ingestion → Type casting → UNION ALL → EDA → Deduplication (ROW_NUMBER)
+        │
+        ▼   Export: RetailCleaned.csv
+[Python / Jupyter]    RFM metrics → Quintile scoring (1–5) → Segment rules → Churn flag
+        │
+        ▼   Export: ECommerceDashboardData.xlsx
+[Power BI Desktop]    Data model → DAX measures → Bookmarks → Interactive drill-downs
 ```
-
-| Step | Tool | What I did |
+ 
+---
+ 
+## 3. Step 1: Data Engineering in SQL Server
+ 
+**Script:** [`sql/data_cleaning.sql`](sql/data_cleaning.sql)
+ 
+| Task | Approach |
+|---|---|
+| Import | Loaded both annual files via the SSMS Flat File Import wizard; overrode auto-detected types (e.g. `Quantity` to INT, `Price` to DECIMAL) |
+| Row-count validation | `COUNT(*)` on each source table after import |
+| Combine years | `UNION ALL` into `dbo.RetailCombined`, with a `SourceSheet` column to preserve lineage |
+| Safe type conversion | `COALESCE(TRY_CONVERT(..., 120), TRY_CONVERT(..., 105))` normalises inconsistent date formats without dropping rows; `TRY_CONVERT(decimal(10,2), Price)` for prices |
+| Conversion audit | Counted rows where date or price conversion returned `NULL` |
+| Data exploration | Missing `Customer_ID`, non-positive `Quantity`, missing `Description`, exact duplicate rows |
+| Deduplication | `ROW_NUMBER() OVER (PARTITION BY <all columns> ORDER BY (SELECT NULL))` in a CTE, keeping `RowNum = 1`, saved to `dbo.RetailCleaned` |
+ 
+**Why SQL for this stage:** the engine handles 1M+ rows without consuming local RAM, and window functions allow precise deduplication that preserves the first instance of each transaction.
+ 
+---
+ 
+## 3. Step 2: RFM & Churn Modelling in Python
+ 
+**Notebook:** [`notebooks/rfm_segmentation.ipynb`](notebooks/rfm_segmentation.ipynb)
+ 
+### 4.1 Preparation
+ 
+- Loaded `RetailCleaned.csv` and parsed `InvoiceDate` as a datetime.
+- Excluded rows with missing `Customer_ID` and rows with `Quantity <= 0`, so the analysis covers confirmed, revenue-generating sales only.
+- Set the **snapshot date to 2011-12-10** (one day after the last recorded order) as the reference point for recency.
+### 4.2 RFM Metrics
+ 
+| Metric | Definition | Pandas logic |
 |---|---|---|
-| **1. Define** | Documentation | Wrote the business problem, questions and key definitions (RFM, churn) before any analysis |
-| **2. Clean** | SQL Server | Imported both yearly sheets, fixed types and dates, ran exploratory checks, removed duplicates, saved `RetailCleaned` |
-| **3. Analyse** | Python (Pandas) | Calculated Recency, Frequency and Monetary per customer, scored each 1 to 5, assigned segments and a 90-day churn flag |
-| **4. Visualise** | Power BI + DAX | Merged results back onto transactions into one analysis-ready table and built the dashboard |
-
-**What is RFM?** A standard way to rate customers on three questions: *How recently did they buy? How often? How much do they spend?*
-
+| **Recency (R)** | Days since the customer's last order | `snapshot_date - InvoiceDate.max()` |
+| **Frequency (F)** | Number of distinct orders | `Invoice.nunique()` |
+| **Monetary (M)** | Total revenue contributed | `sum(Quantity × Price)` |
+ 
+### 4.3 Scoring
+ 
+Each metric is divided into quintiles using `pd.qcut` and scored 1–5. Recency is scored in reverse, so recent buyers receive the highest score. Frequency is ranked (`method='first'`) before binning to handle heavily tied values.
+ 
+### 4.4 Segmentation Rules
+ 
+Rules are evaluated in the order shown.
+ 
+| Order | Segment | Rule | Interpretation |
+|---|---|---|---|
+| 1 | **Champions** | R ≥ 4, F ≥ 4, M ≥ 4 | Recent, frequent, high-spending buyers |
+| 2 | **Loyal** | R ≥ 3, F ≥ 3 | Consistent, repeat buyers |
+| 3 | **At Risk** | R ≤ 2, F ≥ 3 | Previously frequent, now inactive |
+| 4 | **New** | R ≥ 4, F ≤ 2 | Recent buyers with few orders |
+| 5 | **Need Attention** | R = 3, F ≤ 2 | Mid-recency, low frequency |
+| 6 | **Lost** | All remaining | Inactive and low engagement |
+ 
+### 4.5 Churn Definition
+ 
+```python
+rfm['IsChurned'] = rfm['Recency'] > 90   # inactive for more than 90 days
+```
+ 
+### 4.6 Resulting Segment Distribution
+ 
+| Segment | Customers |
+|---|---:|
+| Lost | 1,529 |
+| Loyal | 1,416 |
+| Champions | 1,289 |
+| At Risk | 823 |
+| New | 442 |
+| Need Attention | 382 |
+| **Total** | **5,881** |
+ 
+The RFM output is merged back onto the transaction table (adding `InvoiceMonth` and `Revenue`) and exported for Power BI.
+ 
+**Why Python for this stage:** quantile bucketing, multi-condition labelling and scoring are cleaner and faster to iterate in Pandas than in SQL.
+ 
 ---
-
+ 
+## 5. Step 3: Power BI Dashboard
+ 
+### 5.1 Core DAX Measures
+ 
+| Measure | DAX |
+|---|---|
+| Total Revenue | `SUM(Retail[Revenue])` |
+| Total Customers | `DISTINCTCOUNT(Retail[Customer_ID])` |
+| Churn Rate (%) | `DIVIDE(CALCULATE(DISTINCTCOUNT(Retail[Customer_ID]), Retail[is_churn] = TRUE), [Total Customers])` |
+| Avg Customer Value (ARPU) | `DIVIDE([Total Revenue], [Total Customers])` |
+| Average R / F / M Score | `AVERAGE(Retail[R_Score])`, `AVERAGE(Retail[F_Score])`, `AVERAGE(Retail[M_Score])` |
+ 
+### 5.2 Dashboard Pages
+ 
+| Page | View | Contents |
+|---|---|---|
+| **Business Overview** | Customer view | Customers by segment (split by churn status) and customer counts by month, quarter and year |
+| **Business Overview** | Revenue view | Revenue by segment (bar and pie) and revenue by month, quarter and year |
+| **RFM & Churn Deep-Dive** | Segment view | Segment performance matrix with heat-map formatting, plus churn % trends by month, quarter and year |
+| **RFM & Churn Deep-Dive** | Country view | Country performance summary and top countries by average customer value |
+ 
+**UX features:** bookmark-driven view toggles (Customer / Revenue and Segment / Country), six global slicers (Month, Quarter, Year, Country, Segment, IsChurned), a "Clear all slicers" button, a consistent branded theme, and a metric glossary page for non-technical stakeholders.
 ## Dashboard
 
 | Page | Contents |
@@ -120,11 +203,11 @@ Business questions → SQL Server → Python → Power BI
 
 | Customer view | Revenue view |
 |---|---|
-| ![Customer view](Images/Power_Bi_Snapshot/Mockups/1.png) | ![Revenue view](images/02_overview_revenue.png) |
+| ![Customer view](Assets/Snapshot/Mockups/1.png) | ![Revenue view](Assets/Snapshot/Mockups/Revenue.png) |
 
 | Segment deep-dive | Country deep-dive |
 |---|---|
-| ![Segment view](images/03_deepdive_segment.png) | ![Country view](images/04_deepdive_country.png) |
+| ![Segment view](Assets/Snapshot/Mockups/3.png) | ![Country view](Assets/Snapshot/Mockups/4.png) |
 
 ---
 
@@ -238,12 +321,6 @@ Avg Customer Value = DIVIDE([Total Revenue], [Total Customers])
 └── README.md
 ```
 
-## How to Reproduce
-
-1. Download the Online Retail II dataset from the UCI repository.
-2. Run the scripts in `01_sql` to build the `RetailCleaned` table, then export it to CSV.
-3. Run the notebook in `02_python` to generate the segmented dataset (Excel).
-4. Open the file in `03_powerbi` and point it to the exported Excel file.
 
 ## Next Steps
 
@@ -251,10 +328,3 @@ Avg Customer Value = DIVIDE([Total Revenue], [Total Customers])
 - Customer lifetime value (CLV) estimation
 - Cohort retention analysis
 
-## Acknowledgements
-
-Dataset: Daqing Chen, UCI Machine Learning Repository. README structure inspired by Mansi Goel's end-to-end analytics tutorial series.
-
-## Connect
-
-[LinkedIn](https://www.linkedin.com/in/your-profile) · [GitHub](https://github.com/your-username) · [Email](mailto:your-email@example.com)
